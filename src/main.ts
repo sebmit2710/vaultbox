@@ -68,6 +68,7 @@ export default class VaultboxPlugin extends Plugin {
       }
     });
 
+    // Poll frequently; the configured interval still decides when a sync is due.
     this.registerInterval(window.setInterval(() => {
       void this.runIntervalSyncIfDue();
     }, 30_000));
