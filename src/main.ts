@@ -1,4 +1,4 @@
-import { addIcon, Notice, Plugin } from "obsidian";
+import { addIcon, Notice, Plugin, type TAbstractFile } from "obsidian";
 import {
   createDropboxAuthSession,
   exchangeDropboxAuthCode,
@@ -39,9 +39,15 @@ export default class VaultboxPlugin extends Plugin {
   private ribbonIconEl: HTMLElement | null = null;
   private debugLog!: DebugLog;
   private simulationReport = "";
+  private syncInProgress = false;
+  private syncFinished: Promise<void> | null = null;
+  private resolveSyncFinished: (() => void) | null = null;
+  private localChangeSyncTimer: number | null = null;
+  private lastAutomaticSyncAttemptAt = 0;
 
   async onload(): Promise<void> {
     await this.loadSettings();
+    this.lastAutomaticSyncAttemptAt = Date.now();
     this.debugLog = new DebugLog(this.settings, async (entries) => {
       await this.savePluginData({ debugLog: entries });
     });
@@ -57,6 +63,48 @@ export default class VaultboxPlugin extends Plugin {
       this.keepRibbonIconAtEnd();
       window.setTimeout(() => this.keepRibbonIconAtEnd(), 250);
       window.setTimeout(() => this.keepRibbonIconAtEnd(), 1_500);
+      if (this.settings.syncMode === "automatic" && this.settings.syncOnStartup) {
+        void this.runAutomaticSync("startup");
+      }
+    });
+
+    this.registerInterval(window.setInterval(() => {
+      void this.runIntervalSyncIfDue();
+    }, 30_000));
+
+    this.registerDomEvent(document, "visibilitychange", () => {
+      if (this.settings.syncMode !== "automatic") {
+        return;
+      }
+
+      if (document.visibilityState === "visible") {
+        void this.runAutomaticSync("foreground");
+      } else if (document.visibilityState === "hidden") {
+        void this.runAutomaticSync("background");
+      }
+    });
+
+    this.registerEvent(this.app.workspace.on("quit", (tasks) => {
+      if (this.settings.syncMode !== "automatic") {
+        return;
+      }
+
+      if (this.syncFinished) {
+        tasks.addPromise(this.syncFinished);
+      } else {
+        tasks.addPromise(this.runAutomaticSync("quit"));
+      }
+    }));
+
+    this.registerEvent(this.app.vault.on("create", (file) => this.scheduleLocalChangeSync(file)));
+    this.registerEvent(this.app.vault.on("modify", (file) => this.scheduleLocalChangeSync(file)));
+    this.registerEvent(this.app.vault.on("delete", (file) => this.scheduleLocalChangeSync(file)));
+    this.registerEvent(this.app.vault.on("rename", (file) => this.scheduleLocalChangeSync(file)));
+    this.register(() => {
+      if (this.localChangeSyncTimer !== null) {
+        window.clearTimeout(this.localChangeSyncTimer);
+        this.localChangeSyncTimer = null;
+      }
     });
 
     this.addCommand({
@@ -243,7 +291,24 @@ export default class VaultboxPlugin extends Plugin {
     new Notice(`Vaultbox folder validated: ${metadata.pathDisplay || "/"}`);
   }
 
-  async syncNow(): Promise<void> {
+  async syncNow(options: { silent?: boolean } = {}): Promise<void> {
+    if (this.syncInProgress) {
+      if (!options.silent) {
+        new Notice("Vaultbox sync already in progress.");
+      }
+      return;
+    }
+
+    this.syncInProgress = true;
+    this.syncFinished = new Promise<void>((resolve) => {
+      this.resolveSyncFinished = resolve;
+    });
+    if (this.localChangeSyncTimer !== null) {
+      window.clearTimeout(this.localChangeSyncTimer);
+      this.localChangeSyncTimer = null;
+    }
+
+    const silent = options.silent ?? false;
     this.simulationReport = "";
     const hadExistingSyncState = Object.keys(this.syncState.files).length > 0;
     let progressNotice: Notice | null = null;
@@ -255,7 +320,9 @@ export default class VaultboxPlugin extends Plugin {
         confirm: this.settings.syncMode === "manual" && this.settings.confirmBeforeManualSync,
       });
       this.settings.lastSyncStartedAt = Date.now();
-      progressNotice = new Notice("Vaultbox: preparing sync plan...", 0);
+      if (!silent) {
+        progressNotice = new Notice("Vaultbox: preparing sync plan...", 0);
+      }
       const plan = await this.buildSyncPlan();
       this.writeMutationPathDiagnostics("sync.plan-paths", plan);
       if (plan.conflicts.length > 0) {
@@ -263,7 +330,7 @@ export default class VaultboxPlugin extends Plugin {
         this.settings.lastSyncSummary = message;
         this.debugLog.write("sync.conflicts", plan.summary);
         await this.saveSettings();
-        progressNotice.hide();
+        progressNotice?.hide();
         new Notice(message);
         return;
       }
@@ -273,13 +340,15 @@ export default class VaultboxPlugin extends Plugin {
         this.settings.lastSyncSummary = "No sync required. Everything is up to date.";
         this.debugLog.write("sync.noop", plan.summary);
         await this.saveSettings();
-        progressNotice.hide();
-        new Notice("No sync required. Everything is up to date.");
+        progressNotice?.hide();
+        if (!silent) {
+          new Notice("No sync required. Everything is up to date.");
+        }
         return;
       }
 
       if (this.settings.syncMode === "manual" && this.settings.confirmBeforeManualSync) {
-        progressNotice.hide();
+        progressNotice?.hide();
         progressNotice = null;
         const confirmed = await requestConfirmation(this.app, {
           title: "Confirm sync",
@@ -293,10 +362,12 @@ export default class VaultboxPlugin extends Plugin {
       }
 
       const totalChanges = getPlanChangeCount(plan);
-      if (progressNotice) {
-        progressNotice.setMessage(`Vaultbox syncing: 0/${totalChanges} changes`);
-      } else {
-        progressNotice = new Notice(`Vaultbox syncing: 0/${totalChanges} changes`, 0);
+      if (!silent) {
+        if (progressNotice) {
+          progressNotice.setMessage(`Vaultbox syncing: 0/${totalChanges} changes`);
+        } else {
+          progressNotice = new Notice(`Vaultbox syncing: 0/${totalChanges} changes`, 0);
+        }
       }
       const result = await executeSyncPlan({
         vault: this.app.vault,
@@ -318,8 +389,10 @@ export default class VaultboxPlugin extends Plugin {
         summary: plan.summary,
       });
       await this.saveSettings();
-      progressNotice.hide();
-      new Notice(this.settings.lastSyncSummary);
+      progressNotice?.hide();
+      if (!silent) {
+        new Notice(this.settings.lastSyncSummary);
+      }
     } catch (error) {
       if (error instanceof SyncExecutionError && hadExistingSyncState) {
         this.syncState = error.partialState;
@@ -331,7 +404,67 @@ export default class VaultboxPlugin extends Plugin {
       await this.saveSettings();
       progressNotice?.hide();
       new Notice(message);
+    } finally {
+      this.syncInProgress = false;
+      this.resolveSyncFinished?.();
+      this.resolveSyncFinished = null;
+      this.syncFinished = null;
     }
+  }
+
+  private async runAutomaticSync(reason: string): Promise<void> {
+    if (
+      this.settings.syncMode !== "automatic" ||
+      this.syncInProgress ||
+      !this.isConnected() ||
+      !normalizeDropboxPath(this.settings.selectedFolderPath)
+    ) {
+      return;
+    }
+
+    this.lastAutomaticSyncAttemptAt = Date.now();
+    this.debugLog.write("sync.auto-trigger", { reason });
+    await this.syncNow({ silent: true });
+  }
+
+  private async runIntervalSyncIfDue(): Promise<void> {
+    if (this.settings.syncMode !== "automatic") {
+      return;
+    }
+
+    const intervalMinutes = Math.max(0, this.settings.syncIntervalMinutes);
+    if (intervalMinutes <= 0) {
+      return;
+    }
+
+    const intervalMs = intervalMinutes * 60_000;
+    const lastSyncStartedAt = this.settings.lastSyncStartedAt ?? 0;
+    const lastAttemptAt = Math.max(this.lastAutomaticSyncAttemptAt, lastSyncStartedAt);
+    if (Date.now() - lastAttemptAt < intervalMs) {
+      return;
+    }
+
+    await this.runAutomaticSync("interval");
+  }
+
+  private scheduleLocalChangeSync(file: TAbstractFile): void {
+    if (
+      this.settings.syncMode !== "automatic" ||
+      this.syncInProgress ||
+      file.path === this.app.vault.configDir ||
+      file.path.startsWith(`${this.app.vault.configDir}/`)
+    ) {
+      return;
+    }
+
+    if (this.localChangeSyncTimer !== null) {
+      window.clearTimeout(this.localChangeSyncTimer);
+    }
+
+    this.localChangeSyncTimer = window.setTimeout(() => {
+      this.localChangeSyncTimer = null;
+      void this.runAutomaticSync("local-change");
+    }, 15_000);
   }
 
   async simulateSync(): Promise<void> {
