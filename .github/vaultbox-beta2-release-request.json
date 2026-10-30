@@ -1,6 +1,0 @@
-{
-  "tag": "1.0.11-beta.2",
-  "source_sha": "6fd9c8ad899971149baa895829b78492e02132e7",
-  "requested_at": "2026-10-30",
-  "reason": "Publish tested config-safety beta without merging it to main"
-}
