@@ -7,6 +7,7 @@ import {
 import { requestConfirmation } from "./confirmation-modal";
 import { DROPBOX_APP_KEY } from "./constants";
 import { DebugLog, type DebugLogEntry } from "./debug-log";
+import { ConfigDiagnostics, findConfigRegressions, summarizeConfigState } from "./config-diagnostics";
 import { DropboxClient, normalizeDropboxPath } from "./dropbox";
 import { VAULTBOX_ICON_PATHS } from "./icons";
 import { VaultboxSettingTab } from "./settings-tab";
@@ -38,6 +39,9 @@ export default class VaultboxPlugin extends Plugin {
   syncState: VaultboxSyncState = { files: {}, lastSyncedAt: 0 };
   private ribbonIconEl: HTMLElement | null = null;
   private debugLog!: DebugLog;
+  private configDiagnostics!: ConfigDiagnostics;
+  private configOperation = 0;
+  private warnedAboutConfigLoss = false;
   private simulationReport = "";
   private syncInProgress = false;
   private syncFinished: Promise<void> | null = null;
@@ -46,12 +50,16 @@ export default class VaultboxPlugin extends Plugin {
   private lastAutomaticSyncAttemptAt = 0;
 
   async onload(): Promise<void> {
+    this.configDiagnostics = new ConfigDiagnostics(
+      this.app.vault.adapter,
+      this.manifest.dir ?? this.app.vault.configDir + "/plugins/" + this.manifest.id,
+    );
     await this.loadSettings();
     this.lastAutomaticSyncAttemptAt = Date.now();
     this.debugLog = new DebugLog(this.settings, async (entries) => {
-      await this.savePluginData({ debugLog: entries });
+      await this.savePluginData({ debugLog: entries }, "debug-log");
     });
-    this.debugLog.load((await this.loadPluginData()).debugLog);
+    this.debugLog.load((await this.loadPluginData("startup.debug-log")).debugLog);
 
     addIcon("vaultbox-logo", VAULTBOX_ICON_PATHS);
     this.ribbonIconEl = this.addRibbonIcon("vaultbox-logo", "Sync with Vaultbox", () => {
@@ -139,7 +147,7 @@ export default class VaultboxPlugin extends Plugin {
   }
 
   async loadSettings(): Promise<void> {
-    const data = await this.loadPluginData();
+    const data = await this.loadPluginData("startup.settings");
     const savedSettings = data.settings;
     const { dropboxAppKey: _dropboxAppKey, ...settings } = savedSettings ?? {};
     this.settings = {
@@ -156,7 +164,7 @@ export default class VaultboxPlugin extends Plugin {
     );
   }
 
-  async saveSettings(): Promise<void> {
+  async saveSettings(reason = "settings-change"): Promise<void> {
     const policy = this.getSyncPathPolicy();
     this.settings.syncExtraHiddenDirs = policy.extraHiddenDirs;
     this.settings.syncExcludePaths = policy.excludePatterns;
@@ -165,19 +173,58 @@ export default class VaultboxPlugin extends Plugin {
       settings: this.settings,
       pendingAuthCodeVerifier: this.pendingAuthCodeVerifier,
       syncState: this.syncState,
-    });
+    }, reason);
   }
 
-  async savePluginData(patch: Partial<VaultboxPluginData>): Promise<void> {
-    const current = await this.loadPluginData();
-    await this.saveData({
-      ...current,
-      ...patch,
-    } satisfies VaultboxPluginData);
+  async savePluginData(patch: Partial<VaultboxPluginData>, reason = "plugin-data"): Promise<void> {
+    const operation = ++this.configOperation;
+    const current = await this.loadPluginData("write-read:" + reason);
+    const next = { ...current, ...patch } satisfies VaultboxPluginData;
+    const before = await this.configDiagnostics.observe("write.before", reason, operation, next);
+
+    try {
+      // Keep the existing write behavior unchanged while we gather evidence.
+      await this.saveData(next);
+    } catch (error) {
+      await this.configDiagnostics.observe("write.failed", reason, operation, next);
+      throw error;
+    }
+
+    const after = await this.configDiagnostics.observe("write.after", reason, operation, next);
+    const anomalies = findConfigRegressions(before, after, summarizeConfigState(next));
+    if (anomalies.length > 0) {
+      await this.configDiagnostics.note("write.anomaly", reason, operation, { anomalyCodes: anomalies });
+      if (!this.warnedAboutConfigLoss && reason !== "sync-state.reset") {
+        this.warnedAboutConfigLoss = true;
+        new Notice("Vaultbox detected a configuration mismatch. Preserve config-diagnostics.jsonl before reconnecting.", 12000);
+      }
+    }
   }
 
-  async loadPluginData(): Promise<VaultboxPluginData> {
-    const data: unknown = await this.loadData();
+  async loadPluginData(reason = "plugin-data"): Promise<VaultboxPluginData> {
+    const operation = ++this.configOperation;
+    const before = await this.configDiagnostics.observe("read.before", reason, operation);
+    let data: unknown;
+    try {
+      data = await this.loadData();
+    } catch (error) {
+      await this.configDiagnostics.note("read.failed", reason, operation, {
+        errorType: error instanceof Error ? error.name : "unknown",
+      });
+      throw error;
+    }
+
+    const returned = summarizeConfigState(data);
+    await this.configDiagnostics.note("read.result", reason, operation, { loaded: returned });
+    if (before.state?.refreshTokenPresent && !returned.refreshTokenPresent) {
+      await this.configDiagnostics.note("read.mismatch", reason, operation, {
+        anomalyCodes: ["disk-has-token-but-loadData-returned-no-token"],
+      });
+      if (!this.warnedAboutConfigLoss) {
+        this.warnedAboutConfigLoss = true;
+        new Notice("Vaultbox could not load the stored Dropbox connection. Preserve config-diagnostics.jsonl.", 12000);
+      }
+    }
 
     if (!data || typeof data !== "object") {
       return {};
@@ -205,7 +252,7 @@ export default class VaultboxPlugin extends Plugin {
     this.settings.lastSyncCompletedAt = null;
     this.settings.lastSyncSummary = "Sync tracking reset. The next sync will compare local files and Dropbox as a fresh setup.";
     this.debugLog.write("sync-state.reset");
-    await this.saveSettings();
+    await this.saveSettings("sync-state.reset");
   }
 
   isConnected(): boolean {
@@ -215,7 +262,7 @@ export default class VaultboxPlugin extends Plugin {
   async startDropboxAuth(): Promise<void> {
     const session = await createDropboxAuthSession(DROPBOX_APP_KEY);
     this.pendingAuthCodeVerifier = session.codeVerifier;
-    await this.saveSettings();
+    await this.saveSettings("dropbox.auth-start");
     window.open(session.authUrl);
     new Notice("Dropbox opened. Approve Vaultbox, then paste the authorization code here.");
   }
@@ -235,7 +282,7 @@ export default class VaultboxPlugin extends Plugin {
     this.settings.accessTokenExpiresAt = tokens.accessTokenExpiresAt;
     this.settings.refreshToken = tokens.refreshToken;
     this.pendingAuthCodeVerifier = "";
-    await this.saveSettings();
+    await this.saveSettings("dropbox.auth-complete");
     new Notice("Dropbox connected.");
   }
 
@@ -254,7 +301,7 @@ export default class VaultboxPlugin extends Plugin {
     });
     this.settings.accessToken = refreshed.accessToken;
     this.settings.accessTokenExpiresAt = refreshed.accessTokenExpiresAt;
-    await this.saveSettings();
+    await this.saveSettings("dropbox.token-refresh");
     return refreshed.accessToken;
   }
 
@@ -276,7 +323,7 @@ export default class VaultboxPlugin extends Plugin {
     }
 
     this.settings.selectedFolderPath = folderPath;
-    await this.saveSettings();
+    await this.saveSettings("dropbox.validate-folder");
 
     if (!this.isConnected()) {
       new Notice("Connect Dropbox before validating a folder.");
@@ -309,6 +356,7 @@ export default class VaultboxPlugin extends Plugin {
     }
 
     const silent = options.silent ?? false;
+    const syncReason = silent ? "sync.automatic" : "sync.manual";
     this.simulationReport = "";
     const hadExistingSyncState = Object.keys(this.syncState.files).length > 0;
     let progressNotice: Notice | null = null;
@@ -329,7 +377,7 @@ export default class VaultboxPlugin extends Plugin {
         const message = formatSyncPlan(plan, "Sync blocked");
         this.settings.lastSyncSummary = message;
         this.debugLog.write("sync.conflicts", plan.summary);
-        await this.saveSettings();
+        await this.saveSettings(syncReason + ".conflicts");
         progressNotice?.hide();
         new Notice(message);
         return;
@@ -339,7 +387,7 @@ export default class VaultboxPlugin extends Plugin {
         this.settings.lastSyncCompletedAt = Date.now();
         this.settings.lastSyncSummary = "No sync required. Everything is up to date.";
         this.debugLog.write("sync.noop", plan.summary);
-        await this.saveSettings();
+        await this.saveSettings(syncReason + ".no-changes");
         progressNotice?.hide();
         if (!silent) {
           new Notice("No sync required. Everything is up to date.");
@@ -388,7 +436,7 @@ export default class VaultboxPlugin extends Plugin {
         applied: result.applied,
         summary: plan.summary,
       });
-      await this.saveSettings();
+      await this.saveSettings(syncReason + ".complete");
       progressNotice?.hide();
       if (!silent) {
         new Notice(this.settings.lastSyncSummary);
@@ -396,12 +444,12 @@ export default class VaultboxPlugin extends Plugin {
     } catch (error) {
       if (error instanceof SyncExecutionError && hadExistingSyncState) {
         this.syncState = error.partialState;
-        await this.saveSettings();
+        await this.saveSettings(syncReason + ".partial-failed");
       }
       const message = error instanceof Error ? error.message : String(error);
       this.settings.lastSyncSummary = `Failed: ${message}`;
       this.debugLog.write("sync.failed", { message });
-      await this.saveSettings();
+      await this.saveSettings(syncReason + ".failed");
       progressNotice?.hide();
       new Notice(message);
     } finally {
@@ -485,14 +533,14 @@ export default class VaultboxPlugin extends Plugin {
       this.settings.lastSyncCompletedAt = Date.now();
       this.settings.lastSyncSummary = message;
       this.debugLog.write("simulation.complete", plan.summary);
-      await this.saveSettings();
+      await this.saveSettings("simulation.complete");
       this.simulationReport = report;
       this.showSimulationReport();
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       this.settings.lastSyncSummary = `Simulation failed: ${message}`;
       this.debugLog.write("simulation.failed", { message });
-      await this.saveSettings();
+      await this.saveSettings("simulation.failed");
       new Notice(this.settings.lastSyncSummary);
     }
   }
@@ -518,7 +566,7 @@ export default class VaultboxPlugin extends Plugin {
     }
 
     this.settings.selectedFolderPath = folderPath;
-    await this.saveSettings();
+    await this.saveSettings("sync.plan");
     const pathPolicy = this.getSyncPathPolicy();
 
     const [localFiles, remoteFiles] = await Promise.all([
