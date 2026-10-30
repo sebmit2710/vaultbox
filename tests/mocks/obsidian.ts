@@ -40,3 +40,7 @@ export class Setting {}
 export class App {}
 
 export function addIcon(): void {}
+
+// Minimal UI exports needed to import the real Vaultbox Plugin class in headless tests.
+export class Modal {}
+export function setIcon(): void {}
