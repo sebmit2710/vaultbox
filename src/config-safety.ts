@@ -67,9 +67,7 @@ export class ConfigSafety {
     }
 
     const nextState = summarizeConfigState(next);
-    const previousState = current && current !== "invalid"
-      ? summarizeConfigState(current)
-      : null;
+    const previousState = current ? summarizeConfigState(current) : null;
     const backup = await this.readBestBackup();
     const protectedState = backup && summarizeConfigState(backup);
     const allowReset = reason === "sync-state.reset";
