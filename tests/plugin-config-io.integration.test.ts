@@ -1,5 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
-import { Notice } from "obsidian";
+import { describe, expect, it } from "vitest";
 import VaultboxPlugin from "../src/main";
 import { ConfigDiagnostics } from "../src/config-diagnostics";
 import { DEFAULT_SETTINGS } from "../src/types";
@@ -46,7 +45,8 @@ function fixture() {
       files.set(to, files.get(from)!); files.delete(from);
     },
   };
-  const plugin = Object.assign(Object.create(VaultboxPlugin.prototype) as VaultboxPlugin, {
+  const plugin = Object.create(VaultboxPlugin.prototype) as VaultboxPlugin;
+  Object.assign(plugin as object, {
     app: { vault: { adapter, configDir: ".obsidian" } },
     manifest: { id: "vaultbox", version: "1.0.11-beta.1", dir: root },
     settings: { ...saved.settings },
@@ -82,8 +82,6 @@ function fixture() {
 
   return { plugin, files, events, saved };
 }
-
-beforeEach(() => { Notice.messages = []; });
 
 describe("real Vaultbox plugin configuration I/O with mocked Obsidian storage", () => {
   it("preserves Dropbox connection and tracking during manual sync with no changes", async () => {
