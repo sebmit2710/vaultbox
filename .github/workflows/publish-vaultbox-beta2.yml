@@ -1,0 +1,66 @@
+name: Publish Vaultbox 1.0.11 beta 2
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/vaultbox-beta2-release-request.json
+
+permissions:
+  contents: write
+
+jobs:
+  beta-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: 6fd9c8ad899971149baa895829b78492e02132e7
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+      - run: npm run build
+      - name: Verify beta2 artifacts
+        shell: bash
+        run: |
+          node --input-type=module <<'NODE'
+          import fs from 'node:fs';
+          const version = '1.0.11-beta.2';
+          const manifest = JSON.parse(fs.readFileSync('manifest.json', 'utf8'));
+          const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+          const lock = JSON.parse(fs.readFileSync('package-lock.json', 'utf8'));
+          const versions = JSON.parse(fs.readFileSync('versions.json', 'utf8'));
+          if (manifest.version !== version || pkg.version !== version ||
+              lock.version !== version || lock.packages[''].version !== version ||
+              versions[version] !== manifest.minAppVersion) {
+            throw new Error('Beta metadata does not match release tag');
+          }
+          for (const name of ['main.js','manifest.json','styles.css']) {
+            if (!fs.statSync(name).size) throw new Error('Missing or empty asset: ' + name);
+          }
+          console.log('Validated release assets for ' + version);
+          NODE
+      - name: Publish beta prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          SOURCE_SHA="$(git rev-parse HEAD)"
+          TAG="1.0.11-beta.2"
+          if [ "$SOURCE_SHA" != "6fd9c8ad899971149baa895829b78492e02132e7" ]; then
+            echo "::error::Source SHA mismatch"
+            exit 1
+          fi
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "::error::Release already exists: $TAG"
+            exit 1
+          fi
+          gh release create "$TAG" --target "$SOURCE_SHA" --prerelease \
+            --title "Vaultbox $TAG" --notes-file .github/beta-release-notes.md \
+            main.js manifest.json styles.css
+          gh release view "$TAG" --json tagName,isPrerelease,assets,url
