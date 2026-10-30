@@ -4,6 +4,9 @@ export class Notice {
   constructor(message: string) {
     Notice.messages.push(message);
   }
+
+  hide(): void {}
+  setMessage(_message: string): void {}
 }
 
 type RequestUrl = (request: {
