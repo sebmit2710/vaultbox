@@ -87,7 +87,7 @@ describe("configuration disk I/O forensic integration", () => {
       state: { refreshTokenPresent: true, folderConfigured: true, trackedFiles: 2 },
     });
     expect(after).toMatchObject({ status: "valid" });
-    expect(after.sha256).not.toEqual(before.sha256);
+    expect(after.bytes).not.toEqual(before.bytes);
     expect(findConfigRegressions(before, after, summarizeConfigState(healthy))).toEqual([]);
     expect(env.records().map((item) => item.stage)).toEqual(["write.before", "write.after"]);
     const output = env.files.get(logPath)!;
