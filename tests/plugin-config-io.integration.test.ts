@@ -157,4 +157,40 @@ describe("real Vaultbox plugin configuration I/O with mocked Obsidian storage", 
     expect(state.settings.refreshToken).toBe("private-refresh-token");
     expect(Object.keys(state.syncState.files)).toHaveLength(0);
   });
+  it("allows a real fresh installation with no configuration or marker", async () => {
+    const { plugin, files } = fixture();
+    files.delete(path);
+    await plugin.loadSettings();
+    expect(plugin.settings.refreshToken).toBe("");
+    await plugin.saveSettings("settings-change");
+    expect(files.has(path)).toBe(true);
+    expect(files.has(root + "/data.initialized")).toBe(true);
+  });
+
+  it("detects factory defaults written by another process after a successful setup", async () => {
+    const { plugin, files } = fixture();
+    await plugin.loadSettings();
+    const backup = files.get(root + "/data.last-good.json");
+    files.set(path, JSON.stringify({
+      settings: { ...DEFAULT_SETTINGS },
+      syncState: { files: {}, lastSyncedAt: 0 },
+    }));
+    await expect(plugin.loadSettings()).rejects.toThrow(/Vaultbox safety stop/);
+    expect(files.get(root + "/data.last-good.json")).toBe(backup);
+    expect(JSON.parse(files.get(path)!).settings.refreshToken).toBe("");
+  });
+
+  it("serializes concurrent settings and debug-log writes without dropping either", async () => {
+    const { plugin, files } = fixture();
+    await plugin.loadSettings();
+    await Promise.all([
+      plugin.saveSettings("settings-change"),
+      plugin.savePluginData({ debugLog: [{ timestamp: "2026-10-30T12:00:00.000Z", message: "test" }] }, "debug-log"),
+    ]);
+    const state = JSON.parse(files.get(path)!);
+    expect(state.settings.refreshToken).toBe("private-refresh-token");
+    expect(state.debugLog).toHaveLength(1);
+    expect(files.get(root + "/data.last-good.json")).toContain("private-refresh-token");
+  });
+
 });
