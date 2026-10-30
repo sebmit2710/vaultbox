@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import VaultboxPlugin from "../src/main";
 import { ConfigDiagnostics } from "../src/config-diagnostics";
+import { ConfigSafety } from "../src/config-safety";
 import { DEFAULT_SETTINGS } from "../src/types";
 
 const root = ".obsidian/plugins/vaultbox";
@@ -53,6 +54,8 @@ function fixture() {
     syncState: { ...saved.syncState },
     pendingAuthCodeVerifier: "",
     configDiagnostics: new ConfigDiagnostics(adapter as never, root),
+    configSafety: new ConfigSafety(adapter as never, root),
+    configWriteQueue: Promise.resolve(),
     configOperation: 0,
     warnedAboutConfigLoss: false,
     syncInProgress: false,
@@ -108,16 +111,50 @@ describe("real Vaultbox plugin configuration I/O with mocked Obsidian storage", 
     expect(files.get(path)).toBe("");
   });
 
-  it("shows how an unreadable file could be replaced with defaults after a failed load", async () => {
+  it("fails closed when a previously healthy data.json disappears before restart", async () => {
     const { plugin, files, events } = fixture();
-    files.delete(path); // Obsidian's loadData() returns null for a missing file.
+    await plugin.loadSettings(); // Creates a verified last-known-good backup and marker.
+    const backup = files.get(root + "/data.last-good.json");
+    expect(backup).toContain("private-refresh-token");
+    files.delete(path);
+
+    await expect(plugin.loadSettings()).rejects.toThrow(/Vaultbox safety stop/);
+    await expect(plugin.saveSettings("settings-change")).rejects.toThrow(/Vaultbox safety stop/);
+    expect(files.has(path)).toBe(false);
+    expect(files.get(root + "/data.last-good.json")).toBe(backup);
+    expect(events().some((event) => event.stage === "read.failed")).toBe(true);
+  });
+
+  it("refuses to replace an existing Dropbox token with factory defaults", async () => {
+    const { plugin, files } = fixture();
     await plugin.loadSettings();
-    await plugin.saveSettings("settings-change");
-    const saved = JSON.parse(files.get(path)!);
-    expect(saved.settings.refreshToken).toBe("");
-    expect(saved.settings.selectedFolderPath).toBe("");
-    expect(Object.keys(saved.syncState.files)).toHaveLength(0);
-    expect(events().some((event) => event.stage === "read.before" && (event.disk as { status: string }).status === "missing")).toBe(true);
-    expect(events().some((event) => event.stage === "write.after")).toBe(true);
+    plugin.settings.refreshToken = "";
+    plugin.settings.selectedFolderPath = "";
+    plugin.syncState = { files: {}, lastSyncedAt: 0 };
+    await expect(plugin.saveSettings("settings-change")).rejects.toThrow(/Vaultbox safety stop/);
+    const state = JSON.parse(files.get(path)!);
+    expect(state.settings.refreshToken).toBe("private-refresh-token");
+    expect(Object.keys(state.syncState.files)).toEqual(["example.md"]);
+  });
+
+  it("blocks corrupt zero-byte JSON and preserves the last good backup", async () => {
+    const { plugin, files, events } = fixture();
+    await plugin.loadSettings();
+    files.set(path, "");
+    await expect(plugin.loadSettings()).rejects.toThrow(/Vaultbox safety stop/);
+    await expect(plugin.saveSettings("settings-change")).rejects.toThrow(/Vaultbox safety stop/);
+    expect(files.get(path)).toBe("");
+    expect(files.get(root + "/data.last-good.json")).toContain("private-refresh-token");
+    expect(events().some((event) => event.stage === "read.failed")).toBe(true);
+  });
+
+  it("allows explicit sync-tracking reset without erasing authentication", async () => {
+    const { plugin, files } = fixture();
+    await plugin.loadSettings();
+    plugin.syncState = { files: {}, lastSyncedAt: 0 };
+    await plugin.saveSettings("sync-state.reset");
+    const state = JSON.parse(files.get(path)!);
+    expect(state.settings.refreshToken).toBe("private-refresh-token");
+    expect(Object.keys(state.syncState.files)).toHaveLength(0);
   });
 });
