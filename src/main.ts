@@ -8,6 +8,7 @@ import { requestConfirmation } from "./confirmation-modal";
 import { DROPBOX_APP_KEY } from "./constants";
 import { DebugLog, type DebugLogEntry } from "./debug-log";
 import { ConfigDiagnostics, findConfigRegressions, summarizeConfigState } from "./config-diagnostics";
+import { ConfigSafety } from "./config-safety";
 import { DropboxClient, normalizeDropboxPath } from "./dropbox";
 import { VAULTBOX_ICON_PATHS } from "./icons";
 import { VaultboxSettingTab } from "./settings-tab";
@@ -40,6 +41,8 @@ export default class VaultboxPlugin extends Plugin {
   private ribbonIconEl: HTMLElement | null = null;
   private debugLog!: DebugLog;
   private configDiagnostics!: ConfigDiagnostics;
+  private configSafety!: ConfigSafety;
+  private configWriteQueue: Promise<void> = Promise.resolve();
   private configOperation = 0;
   private warnedAboutConfigLoss = false;
   private simulationReport = "";
@@ -50,11 +53,15 @@ export default class VaultboxPlugin extends Plugin {
   private lastAutomaticSyncAttemptAt = 0;
 
   async onload(): Promise<void> {
-    this.configDiagnostics = new ConfigDiagnostics(
-      this.app.vault.adapter,
-      this.manifest.dir ?? this.app.vault.configDir + "/plugins/" + this.manifest.id,
-    );
-    await this.loadSettings();
+    const pluginDirectory = this.manifest.dir ?? this.app.vault.configDir + "/plugins/" + this.manifest.id;
+    this.configDiagnostics = new ConfigDiagnostics(this.app.vault.adapter, pluginDirectory);
+    this.configSafety = new ConfigSafety(this.app.vault.adapter, pluginDirectory);
+    try {
+      await this.loadSettings();
+    } catch (error) {
+      new Notice("Vaultbox stopped to protect its Dropbox configuration. See the console and config-diagnostics.jsonl.", 15000);
+      throw error;
+    }
     this.lastAutomaticSyncAttemptAt = Date.now();
     this.debugLog = new DebugLog(this.settings, async (entries) => {
       await this.savePluginData({ debugLog: entries }, "debug-log");
@@ -177,14 +184,22 @@ export default class VaultboxPlugin extends Plugin {
   }
 
   async savePluginData(patch: Partial<VaultboxPluginData>, reason = "plugin-data"): Promise<void> {
+    // Serialize read/merge/write and backup operations, including async debug logging.
+    const task = this.configWriteQueue.then(() => this.writePluginData(patch, reason));
+    this.configWriteQueue = task.catch(() => undefined);
+    await task;
+  }
+
+  private async writePluginData(patch: Partial<VaultboxPluginData>, reason: string): Promise<void> {
     const operation = ++this.configOperation;
     const current = await this.loadPluginData("write-read:" + reason);
     const next = { ...current, ...patch } satisfies VaultboxPluginData;
     const before = await this.configDiagnostics.observe("write.before", reason, operation, next);
 
     try {
-      // Keep the existing write behavior unchanged while we gather evidence.
+      await this.configSafety.assertWritable(next, reason);
       await this.saveData(next);
+      await this.configSafety.afterWrite(next);
     } catch (error) {
       await this.configDiagnostics.observe("write.failed", reason, operation, next);
       throw error;
@@ -206,6 +221,7 @@ export default class VaultboxPlugin extends Plugin {
     const before = await this.configDiagnostics.observe("read.before", reason, operation);
     let data: unknown;
     try {
+      await this.configSafety.assertReadable();
       data = await this.loadData();
     } catch (error) {
       await this.configDiagnostics.note("read.failed", reason, operation, {
